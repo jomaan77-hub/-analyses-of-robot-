@@ -8,7 +8,7 @@ import os
 # ==========================================
 CONFIG = {
     'FC': 30.0, 'FY': 420.0, 'SBC': 200.0,
-    'FLOORS': 5, 'LOAD_m2': 1.6,
+    'FLOORS': 3, 'LOAD_m2': 1.6,
     'WALL_LOAD_M': 12.0, 'PLANTED_COL_LOAD': 450.0,
 }
 
