@@ -1,21 +1,19 @@
 import ezdxf
-import math
 import os
 
 class SmartStructuralFix:
     def __init__(self, filepath):
-        self.filepath = filepath
+        self.filepath = filepath  # ✅ تم إصلاح الخطأ: حفظ مسار الملف
         try:
             self.doc = ezdxf.readfile(filepath)
             self.msp = self.doc.modelspace()
             print("✅ تم تحميل الملف. جاري المعالجة الذكية...")
         except Exception as e:
-            print(f"Error loading file: {e}")
+            print(f"❌ خطأ في قراءة الملف: {e}")
             self.doc = None
             return
 
         # 1. كشف الوحدات تلقائياً (Auto-Detect Units)
-        # نقيس متوسط إحداثيات العناصر. إذا كانت ضخمة (>1000) فهي مليمتر.
         sample_pts = []
         for e in self.msp.query('LWPOLYLINE'):
              if len(sample_pts) > 10: break
@@ -26,11 +24,13 @@ class SmartStructuralFix:
         if avg_coord > 500:
             self.UNIT_SCALE = "MM"
             self.LIMIT_40CM = 400.0  # حد الميدة التحويلية
-            print("Detected Units: MILLIMETERS (MM)")
+            self.TXT_RATIO = 250.0   # معامل (غير مستخدم حالياً لكن موجود)
+            print("   - الوحدات المكتشفة: مليمتر (MM)")
         else:
             self.UNIT_SCALE = "M"
             self.LIMIT_40CM = 0.40   # حد الميدة التحويلية
-            print("Detected Units: METERS (M)")
+            self.TXT_RATIO = 0.25
+            print("   - الوحدات المكتشفة: متر (M)")
 
         # إعداد الطبقات
         self.LAYERS = {
@@ -62,7 +62,8 @@ class SmartStructuralFix:
             beam_width = min(w, h)
 
             # الشرط الفاصل (حسب الوحدة المكتشفة)
-            is_transfer = (beam_width >= (self.LIMIT_40CM - 0.01)) # هامش خطأ بسيط
+            # نطرح هامش بسيط (0.01) لتفادي مشاكل التقريب
+            is_transfer = (beam_width >= (self.LIMIT_40CM - 0.01))
 
             self.beams_db.append({
                 'rect': (x1, x2, y1, y2), # حدود الميدة
@@ -92,7 +93,8 @@ class SmartStructuralFix:
             e.dxf.layer = self.LAYERS['COL_OUT']
             e.dxf.color = 4 # Cyan
 
-            # حجم النص الذكي (دائماً متناسب مع حجم العمود)
+            # حجم النص الذكي: 40% من عرض العمود
+            # هذا يضمن أن النص لن يكون عملاقاً أبداً
             txt_h = min(w, h) * 0.40
 
             # كتابة النص
@@ -105,7 +107,6 @@ class SmartStructuralFix:
 
     # --- 3. رسم القاعدة ---
     def draw_footing(self, cx, cy, col_w, col_h):
-        # حجم القاعدة (نسبة وتناسب للرسم النظيف)
         # القاعدة تكون 3 أضعاف العمود تقريباً
         f_side = max(col_w, col_h) * 3.0
 
@@ -113,7 +114,7 @@ class SmartStructuralFix:
         pts = [(cx-hw, cy-hw), (cx+hw, cy-hw), (cx+hw, cy+hw), (cx-hw, cy+hw)]
         self.msp.add_lwpolyline(pts, dxfattribs={'layer': self.LAYERS['FND_OUT'], 'closed':True, 'color': 2})
 
-        # نص القاعدة
+        # نص القاعدة (أصغر قليلاً من نص العمود)
         txt_h = min(col_w, col_h) * 0.30
         self.add_text(cx, cy - f_side/2 - txt_h, f"F", txt_h, 7)
 
@@ -142,19 +143,21 @@ class SmartStructuralFix:
         })
 
     def run(self):
-        if self.doc is None:
-            print("❌ لم يتم تحميل الملف بنجاح.")
-            return
+        if not self.doc: return
         self.analyze_beams()
         self.process_columns()
         self.draw_beams()
+
+        # حفظ الملف باسم جديد
         out = self.filepath.replace(".dxf", "_CLEAN.dxf")
         self.doc.saveas(out)
-        print(f"🎉 تم التنظيف! الملف: {out}")
+        print(f"🎉 تم التنظيف! الملف الجاهز: {out}")
 
 if __name__ == "__main__":
-    filename = "My Drawing.dxf" if os.path.exists("My Drawing.dxf") else "MyDrawing.dxf"
-    if os.path.exists(filename):
-        SmartStructuralFix(filename).run()
+    # تأكد أن اسم الملف مطابق لما رفعته
+    if os.path.exists("MyDrawing.dxf"):
+        SmartStructuralFix("MyDrawing.dxf").run()
+    elif os.path.exists("My Drawing.dxf"):
+        SmartStructuralFix("My Drawing.dxf").run()
     else:
-        print(f"File not found: {filename}")
+        print("⚠️ يرجى رفع ملف DXF وتسميته MyDrawing.dxf")
