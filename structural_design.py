@@ -2,6 +2,7 @@ import ezdxf
 import math
 import pandas as pd
 import os
+import csv
 
 # ==========================================
 # ⚙️ ثوابت المواد (Material Properties)
@@ -40,6 +41,10 @@ class AnalyticalDesigner:
         self.beams_data = []
         self.excel_beams = []
         self.excel_cols = []
+
+        # قوائم لتصدير الريفت
+        self.revit_cols = []
+        self.revit_beams = []
 
     def get_geo(self, e):
         pts = e.get_points('xy')
@@ -172,6 +177,26 @@ class AnalyticalDesigner:
                 'Shear (kN)': int(Vu),
                 'Rebar': f"{num_bars} T{dia}"
             })
+
+            # إضافة لبيانات الريفت
+            # نحتاج نقطة بداية ونهاية للميدة. المربع (bbox) ليس دقيقاً تماماً كخط،
+            # لكن للتبسيط سنستخدم منتصف الأضلاع القصيرة للمستطيل
+            # أو ببساطة خط يمر بالمركز ويمتد بطول الـ span
+            # الخوارزمية البسيطة: خط أفقي أو رأسي حسب الأبعاد
+            if w > h: # Horizontal
+                bx1, by1 = cx - span/2, cy
+                bx2, by2 = cx + span/2, cy
+            else:     # Vertical
+                bx1, by1 = cx, cy - span/2
+                bx2, by2 = cx, cy + span/2
+
+            self.revit_beams.append({
+                'Width': width,
+                'StartX': bx1, 'StartY': by1,
+                'EndX': bx2, 'EndY': by2,
+                'FamilyType': f"{int(width*1000)}x{int(calc_depth*1000)}mm"
+            })
+
             count += 1
 
     # ----------------------------------------------------
@@ -235,6 +260,15 @@ class AnalyticalDesigner:
                 'Col Rebar': f"{bars} T16",
                 'Footing': ft_txt
             })
+
+            # إضافة لبيانات الريفت
+            self.revit_cols.append({
+                'Width': w,
+                'Depth': h,
+                'X': cx, 'Y': cy,
+                'FamilyType': f"{int(w*1000)}x{int(h*1000)}mm"
+            })
+
             if not is_planted: count += 1
 
     def add_text(self, x, y, text, h, color):
@@ -256,7 +290,22 @@ class AnalyticalDesigner:
             pd.DataFrame(self.excel_beams).to_excel(writer, sheet_name='Beams Analysis', index=False)
             pd.DataFrame(self.excel_cols).to_excel(writer, sheet_name='Cols & Footings', index=False)
 
+        # تصدير ملفات CSV للريفت
+        col_csv = 'columns_for_revit.csv'
+        beam_csv = 'beams_for_revit.csv'
+
+        with open(col_csv, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=['Width', 'Depth', 'X', 'Y', 'FamilyType'])
+            writer.writeheader()
+            writer.writerows(self.revit_cols)
+
+        with open(beam_csv, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=['Width', 'StartX', 'StartY', 'EndX', 'EndY', 'FamilyType'])
+            writer.writeheader()
+            writer.writerows(self.revit_beams)
+
         print(f"🎉 تم التصميم التحليلي! \n- المخطط: {dxf_out} \n- الحسابات: {xls_out}")
+        print(f"- بيانات الريفت: {col_csv}, {beam_csv}")
 
 # إعدادات المستخدم (يمكنك تعديلها هنا)
 CONFIG = {
