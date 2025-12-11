@@ -15,7 +15,7 @@ CONST = {
 
     # الأحمال
     'WALL_LOAD': 12.0,   # حمل الجدار (kN/m)
-    'PLANTED_P': 450.0,  # حمل المزروع (kN)
+    'PLANTED_P': 250.0,  # حمل المزروع (kN)
     'CONC_DEN': 25.0,    # كثافة الخرسانة
 }
 
@@ -272,4 +272,4 @@ if __name__ == "__main__":
     elif os.path.exists("My Drawing.dxf"):
         AnalyticalDesigner("My Drawing.dxf").run()
     else:
-        print("⚠️ الملف غير موجود: MyDrawing.dxf أو My Drawing.dxf")
+        print("⚠️ الملف غير موجود")
