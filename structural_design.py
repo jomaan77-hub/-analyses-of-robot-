@@ -1,233 +1,217 @@
 import ezdxf
 import math
+import pandas as pd
 import os
 
-# === إعدادات المشروع ===
+# ==========================================
+# ⚙️ إعدادات التصميم
+# ==========================================
 CONFIG = {
     'FC': 30.0, 'FY': 420.0, 'SBC': 200.0,
-    'FLOORS': 3, 'LOAD_m2': 1.6,
+    'FLOORS': 5, 'LOAD_m2': 1.6,
     'WALL_LOAD_M': 12.0, 'PLANTED_COL_LOAD': 450.0,
-    'TRANSFER_WIDTH_LIMIT': 0.40,
-
-    # الطبقات
-    'L_COL_IN':   'S-COL-CONC',
-    'L_BEAM_IN':  'S-BEAM-MAIN',
-
-    # المخرجات
-    'L_OUT_COL':  'S-DESIGN-COL',
-    'L_OUT_FND':  'S-DESIGN-FND',
-    'L_OUT_BEAM': 'S-DESIGN-BEAM',
-    'L_TXT':      'S-DESIGN-TXT'
 }
 
-class StructuralProject:
+class StructuralFixFinalV2:
     def __init__(self, filepath):
         self.filepath = filepath
         try:
             self.doc = ezdxf.readfile(filepath)
             self.msp = self.doc.modelspace()
-            print("✅ تم التحميل. جاري التحليل الإنشائي لتوجيه الأعمدة...")
+            print("✅ تم التحميل. جاري التحليل...")
         except Exception as e:
-            print(f"Error loading file: {e}")
+            print(f"❌ خطأ: {e}")
             self.doc = None
             return
 
-        for l in [CONFIG['L_OUT_COL'], CONFIG['L_OUT_FND'], CONFIG['L_OUT_BEAM'], CONFIG['L_TXT']]:
-            if l not in self.doc.layers: self.doc.layers.new(l)
+        # ---------------------------------------------------------
+        # 1. كشف الوحدات الذكي (Smart Unit Detection v2)
+        # ---------------------------------------------------------
+        # بدلاً من الإحداثيات، سنقيس "أبعاد" العناصر نفسها
+        widths = []
+        for e in self.msp.query('LWPOLYLINE'):
+            if len(widths) > 20: break
+            # حساب أصغر بعد (العرض)
+            pts = e.get_points('xy')
+            if not pts: continue
+            xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+            w, h = max(xs)-min(xs), max(ys)-min(ys)
+            if w > 0 and h > 0:
+                widths.append(min(w, h))
 
-        self.beams_data = [] # لتخزين بيانات الميدات
-        self.cols_optimized = [] # لتخزين الأعمدة بعد تعديل اتجاهها
+        avg_w = sum(widths)/len(widths) if widths else 0.0
 
-    def get_bbox(self, entity):
-        pts = entity.get_points('xy')
+        # الحكم المنطقي
+        if avg_w > 10.0:
+            # مستحيل أن يكون عرض عمود 200 متر! إذن هو مليمتر
+            self.IS_MM = True
+            self.SCALE = 1000.0
+            self.LIMIT_TRANS = 390.0 # حد التحويلية (ملم)
+            print(f"   - الوحدات المكتشفة: مليمتر (متوسط العرض {int(avg_w)})")
+        else:
+            # عرض 0.20 أو 0.40 منطقي للمتر
+            self.IS_MM = False
+            self.SCALE = 1.0
+            self.LIMIT_TRANS = 0.39  # حد التحويلية (متر)
+            print(f"   - الوحدات المكتشفة: متر (متوسط العرض {avg_w:.2f})")
+
+        # الطبقات
+        self.LAYERS = {
+            'COL': 'S-COL-CONC', 'BEAM': 'S-BEAM-MAIN',
+            'OUT_COL': 'S-DESIGN-COL', 'OUT_FND': 'S-DESIGN-FND',
+            'OUT_BEAM': 'S-DESIGN-BEAM', 'OUT_TXT': 'S-DESIGN-TXT'
+        }
+        for k, name in self.LAYERS.items():
+            if name not in self.doc.layers: self.doc.layers.new(name)
+
+        self.beams_db = []
+        self.report_beams = []
+        self.report_cols = []
+
+    def get_geo(self, e):
+        pts = e.get_points('xy')
         xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
-        return sum(xs)/len(xs), sum(ys)/len(ys), max(xs)-min(xs), max(ys)-min(ys)
+        w, h = max(xs)-min(xs), max(ys)-min(ys)
+        cx, cy = sum(xs)/len(xs), sum(ys)/len(ys)
+        return cx, cy, w, h, min(xs), max(xs), min(ys), max(ys)
 
-    # 1. تحليل شبكة الميدات (Beam Network Analysis)
-    def analyze_beams_network(self):
-        print("🔍 تحليل شبكة الميدات لتحديد البحور الطويلة...")
-        query = f'LWPOLYLINE[layer=="{CONFIG["L_BEAM_IN"]}"]'
+    # --- معالجة الميدات ---
+    def process_beams(self):
+        query = f'LWPOLYLINE[layer=="{self.LAYERS["BEAM"]}"]'
+        count = 1
 
-        for entity in self.msp.query(query):
-            if not entity.is_closed: continue
-            cx, cy, raw_w, raw_h = self.get_bbox(entity)
+        for e in self.msp.query(query):
+            if not e.is_closed: continue
+            cx, cy, w, h, x1, x2, y1, y2 = self.get_geo(e)
 
-            # تحديد: هل هذه الميدة أفقية أم رأسية؟ وما هو طولها؟
-            if raw_w > raw_h:
-                orient = 'H' # Horizontal Beam
-                span = raw_w
-                width = raw_h
+            b_width = min(w, h); span = max(w, h)
+
+            # تحديد التحويلية
+            is_trans = (b_width >= self.LIMIT_TRANS)
+
+            self.beams_db.append({'box': (x1, x2, y1, y2), 'is_trans': is_trans})
+
+            # الحسابات (بالمتر دائماً)
+            math_w = b_width / self.SCALE
+            math_span = span / self.SCALE
+
+            # تجاهل العناصر الصغيرة جداً (أخطاء رسم)
+            if math_span < 0.5: continue
+
+            if is_trans:
+                e.dxf.layer = self.LAYERS['OUT_BEAM']; e.dxf.color = 6 # Magenta
+                depth = 0.80; dia = 16; txt_type = "TR"
+                mu = (12 * math_span**2 / 8) + (CONFIG['PLANTED_COL_LOAD'] * math_span / 4)
             else:
-                orient = 'V' # Vertical Beam
-                span = raw_h
-                width = raw_w
+                e.dxf.layer = self.LAYERS['OUT_BEAM']; e.dxf.color = 3 # Green
+                depth = 0.60; dia = 14; txt_type = "B"
+                mu = (12 * math_span**2 / 8)
 
-            # تصحيح الوحدات
-            if span > 10: span/=1000; width/=1000; cx/=1000; cy/=1000 # تحويل مؤقت للحسابات
+            d_eff = depth - 0.05
+            as_req = (mu * 10**6) / (0.85 * CONFIG['FY'] * d_eff * 1000)
+            bars = math.ceil(as_req / (201 if dia==16 else 154))
+            if bars < 3: bars = 3
 
-            is_transfer = (width >= CONFIG['TRANSFER_WIDTH_LIMIT'])
+            # الكتابة (Dynamic Text Size)
+            # نستخدم نسبة من العرض لضمان القراءة
+            txt_h = b_width * 0.35
 
-            self.beams_data.append({
-                'center': (cx, cy),
-                'span': span,
-                'width': width,
-                'orient': orient,
-                'is_transfer': is_transfer,
-                'entity': entity # نحتفظ بالرسم الأصلي
+            label = f"{txt_type}\n{int(math_w*100)}x{int(depth*100)}\n{bars}T{dia}"
+            self.add_text(cx, cy, label, txt_h, 7)
+
+            # التقرير
+            self.report_beams.append({
+                'ID': f"{txt_type}-{count}",
+                'Type': "Transfer" if is_trans else "Tie",
+                'W(m)': round(math_w, 2),
+                'D(m)': depth,
+                'Span(m)': round(math_span, 2),
+                'Mu(kN.m)': int(mu),
+                'Rebar': f"{bars}T{dia}"
             })
+            count += 1
 
-    # 2. الخوارزمية الذكية لتوجيه الأعمدة (Smart Orientation Algorithm)
-    def optimize_columns(self):
-        print("🧠 جاري اتخاذ القرار لتوجيه ضرب الأعمدة...")
-        query = f'LWPOLYLINE[layer=="{CONFIG["L_COL_IN"]}"]'
+    # --- معالجة الأعمدة ---
+    def process_columns(self):
+        query = f'LWPOLYLINE[layer=="{self.LAYERS["COL"]}"]'
+        count = 1
 
-        for entity in self.msp.query(query):
-            if not entity.is_closed: continue
-            cx, cy, raw_w, raw_h = self.get_bbox(entity)
+        for e in self.msp.query(query):
+            if not e.is_closed: continue
+            cx, cy, w, h, x1, x2, y1, y2 = self.get_geo(e)
 
-            # أبعاد العمود (بغض النظر عن اتجاهه الحالي)
-            col_short = min(raw_w, raw_h)
-            col_long = max(raw_w, raw_h)
-
-            # --- التحليل الإنشائي: ماذا يحيط بالعمود؟ ---
-            max_span_H = 0.0 # أقصى بحر أفقي متصل
-            max_span_V = 0.0 # أقصى بحر رأسي متصل
-
-            # نبحث عن الميدات التي "تلمس" أو تقترب من هذا العمود
-            # نحول إحداثيات العمود للمتر للمقارنة
-            ccx, ccy = (cx/1000, cy/1000) if cx > 1000 else (cx, cy)
-
+            # كشف المزروع (هامش تلامس)
             is_planted = False
+            tol = min(w, h) * 0.5
+            for b in self.beams_db:
+                if b['is_trans']:
+                    bx1, bx2, by1, by2 = b['box']
+                    if (bx1-tol < cx < bx2+tol) and (by1-tol < cy < by2+tol):
+                        is_planted = True; break
 
-            for beam in self.beams_data:
-                bx, by = beam['center']
-                # المسافة بين مركز العمود ومركز الميدة
-                dist_x = abs(ccx - bx)
-                dist_y = abs(ccy - by)
+            e.dxf.layer = self.LAYERS['OUT_COL']; e.dxf.color = 4
 
-                # هل العمود يحمل هذه الميدة؟ (نقطة اتصال)
-                # شرط الاتصال: المسافة تكون نصف طول الميدة تقريباً
-                is_connected = False
-                if beam['orient'] == 'H' and dist_y < 0.5 and dist_x < (beam['span']/2 + 0.5):
-                    max_span_H = max(max_span_H, beam['span'])
-                    is_connected = True
-                elif beam['orient'] == 'V' and dist_x < 0.5 and dist_y < (beam['span']/2 + 0.5):
-                    max_span_V = max(max_span_V, beam['span'])
-                    is_connected = True
+            math_w = w / self.SCALE; math_h = h / self.SCALE
 
-                # هل هو مزروع؟ (يقع في منتصف ميدة تحويلية)
-                if beam['is_transfer'] and dist_x < 0.5 and dist_y < 0.5: # قريب جداً من المركز
-                     is_planted = True
+            # تجاهل الصغير جدا
+            if math_w < 0.1: continue
 
-            # --- قرار التوجيه (Decision Making) ---
-            if is_planted:
-                # العمود المزروع يتبع اتجاه الميدة التي تحمله
-                # (سنتركه كما رسمته أنت، أو نوجهه مع الميدة)
-                final_w, final_h = raw_w, raw_h # نحافظ عليه كما هو للأمان
-                col_type = "Planted"
-                color = 4
+            pu = (math_w * math_h * 130) * CONFIG['LOAD_m2'] * CONFIG['FLOORS'] * 9.81 * 1.4
 
-            elif max_span_H > max_span_V:
-                # البحر الأفقي هو الأكبر -> وجه العمود أفقياً لتقصير البحر
-                final_w, final_h = col_long, col_short
-                col_type = "C (Opt-H)"
-                color = 130 # لون مميز
+            txt_h = min(w, h) * 0.35
+            col_tag = "Planted" if is_planted else f"C{count}"
+            self.add_text(cx, cy, f"{col_tag}\n{int(pu)}kN", txt_h, 1)
 
-            elif max_span_V > max_span_H:
-                # البحر الرأسي هو الأكبر -> وجه العمود رأسياً
-                final_w, final_h = col_short, col_long
-                col_type = "C (Opt-V)"
-                color = 130
-
-            else:
-                # متعادل أو لا توجد ميدات (عمود منفصل) -> اترك كما رسم
-                final_w, final_h = raw_w, raw_h
-                col_type = "C"
-                color = 4
-
-            # --- الحسابات والتخزين ---
-            pu = (col_long/1000 * col_short/1000 * 130) * CONFIG['LOAD_m2'] * CONFIG['FLOORS'] * 9.81 * 1.4
-            if cx > 1000: pu *= 1000*1000 # تصحيح إذا حدث خطأ وحدات
-
-            self.cols_optimized.append({
-                'center': (cx, cy),
-                'dim': (final_w, final_h),
-                'load': pu,
-                'is_planted': is_planted,
-                'type': col_type,
-                'color': color
-            })
-
-    # 3. مرحلة الرسم النهائي (Execution Phase)
-    def draw_results(self):
-        print("✍️ رسم المخطط النهائي المحسن...")
-
-        # أ) رسم الأعمدة الموجهة والقواعد
-        for col in self.cols_optimized:
-            cx, cy = col['center']
-            w, h = col['dim']
-
-            # رسم العمود الجديد
-            self.draw_rect(cx, cy, w, h, CONFIG['L_OUT_COL'], col['color'])
-            self.add_text(cx, cy, f"{col['type']}\n{int(col['load'])}kN", 0.15)
-
+            footing_txt = "Planted"
             # رسم القاعدة (لغير المزروع)
-            if not col['is_planted']:
-                p_srv = col['load'] / 1.4
-                req_area = p_srv / CONFIG['SBC']
-                side = math.sqrt(req_area)
-                side = max(side, 1.2); side = math.ceil(side*10)/10.0
+            if not is_planted:
+                p_srv = pu / 1.4; area = p_srv / CONFIG['SBC']
+                side = math.sqrt(area); side = max(side, 1.2)
+                side = math.ceil(side * 10) / 10.0
+
+                draw_side = side * self.SCALE
                 depth = 0.60
 
-                # رسم القاعدة
-                self.draw_rect(cx, cy, side, side, CONFIG['L_OUT_FND'], 2)
-                self.add_text(cx, cy-0.8, f"F:{side}x{side}", 0.20)
+                hw = draw_side / 2
+                pts = [(cx-hw, cy-hw), (cx+hw, cy-hw), (cx+hw, cy+hw), (cx-hw, cy+hw)]
+                self.msp.add_lwpolyline(pts, dxfattribs={'layer': self.LAYERS['OUT_FND'], 'closed':True, 'color': 2})
 
-        # ب) رسم الميدات (نفس الميدات الأصلية مع التلوين)
-        for beam in self.beams_data:
-            # هنا سنعيد رسم مستطيل الميدة الأصلي في الطبقة الجديدة
-            # (للتبسيط سنرسم مستطيلاً جديداً بنفس الأبعاد)
-            cx, cy = beam['center']
+                self.add_text(cx, cy - draw_side/2 - txt_h, f"F:{side}x{side}", txt_h, 7)
+                footing_txt = f"{side}x{side}x{depth}"
 
-            # نحتاج الأبعاد الأصلية بالمليمتر إذا كان الملف ملم
-            span_draw = beam['span'] * 1000 if cx > 1000 else beam['span']
-            width_draw = beam['width'] * 1000 if cx > 1000 else beam['width']
+            self.report_cols.append({
+                'ID': col_tag,
+                'Dim(m)': f"{round(math_w,2)}x{round(math_h,2)}",
+                'Load(kN)': int(pu),
+                'Footing': footing_txt
+            })
+            count += 1
 
-            # تحديد الأبعاد (w, h) بناء على الاتجاه
-            if beam['orient'] == 'H': w, h = span_draw, width_draw
-            else: w, h = width_draw, span_draw
-
-            layer = CONFIG['L_OUT_BEAM']
-            color = 6 if beam['is_transfer'] else 3
-            type_txt = "TRANSFER" if beam['is_transfer'] else "BM"
-
-            self.draw_rect(cx, cy, w, h, layer, color)
-            self.add_text(cx, cy, f"{type_txt}", 0.15)
-
-    def draw_rect(self, cx, cy, w, h, lay, col):
-        hw, hh = w/2, h/2
-        pts = [(cx-hw, cy-hh), (cx+hw, cy-hh), (cx+hw, cy+hh), (cx-hw, cy+hh)]
-        self.msp.add_lwpolyline(pts, dxfattribs={'layer': lay, 'closed': True, 'color': col})
-
-    def add_text(self, cx, cy, txt, h):
-        if cx > 1000: h *= 1000
-        self.msp.add_mtext(txt, dxfattribs={
-            'insert': (cx, cy), 'char_height': h,
-            'layer': CONFIG['L_TXT'], 'color': 7, 'attachment_point': 5
+    def add_text(self, x, y, text, h, color):
+        self.msp.add_mtext(text, dxfattribs={
+            'insert': (x, y), 'char_height': h,
+            'layer': self.LAYERS['OUT_TXT'], 'color': color, 'attachment_point': 5
         })
 
     def run(self):
-        if self.doc is None: return
-        self.analyze_beams_network()
-        self.optimize_columns()
-        self.draw_results()
-        self.doc.saveas(self.filepath.replace(".dxf", "_OPTIMIZED.dxf"))
-        print("Done.")
+        if not self.doc: return
+        self.process_beams()
+        self.process_columns()
+
+        dxf_out = self.filepath.replace(".dxf", "_FINAL_V2.dxf")
+        xls_out = self.filepath.replace(".dxf", "_DATA_V2.xlsx")
+
+        self.doc.saveas(dxf_out)
+        with pd.ExcelWriter(xls_out) as writer:
+            pd.DataFrame(self.report_beams).to_excel(writer, sheet_name='Beams', index=False)
+            pd.DataFrame(self.report_cols).to_excel(writer, sheet_name='Columns', index=False)
+
+        print(f"🎉 تم الإصلاح! \n- DXF: {dxf_out} \n- Excel: {xls_out}")
 
 if __name__ == "__main__":
-    if os.path.exists("My Drawing.dxf"):
-        StructuralProject("My Drawing.dxf").run()
-    elif os.path.exists("MyDrawing.dxf"):
-        StructuralProject("MyDrawing.dxf").run()
+    if os.path.exists("MyDrawing.dxf"):
+        StructuralFixFinalV2("MyDrawing.dxf").run()
+    elif os.path.exists("My Drawing.dxf"):
+        StructuralFixFinalV2("My Drawing.dxf").run()
     else:
-        print("File 'My Drawing.dxf' or 'MyDrawing.dxf' not found.")
+        print("⚠️ يرجى رفع الملف باسم MyDrawing.dxf")
