@@ -4,69 +4,42 @@ import pandas as pd
 import os
 
 # ==========================================
-# ⚙️ إعدادات التصميم
+# ⚙️ ثوابت المواد (Material Properties)
 # ==========================================
-CONFIG = {
-    'FC': 30.0, 'FY': 420.0, 'SBC': 200.0,
-    'FLOORS': 3, 'LOAD_m2': 1.6,
-    'WALL_LOAD_M': 12.0, 'PLANTED_COL_LOAD': 450.0,
+CONST = {
+    'FC': 30.0,      # f'c (MPa)
+    'FY': 420.0,     # fy (MPa)
+    'SBC': 200.0,    # Soil Bearing Capacity
+    'PHI_B': 0.9,    # Reduction factor (Bending)
+    'PHI_V': 0.75,   # Reduction factor (Shear)
+
+    # الأحمال
+    'WALL_LOAD': 12.0,   # حمل الجدار (kN/m)
+    'PLANTED_P': 450.0,  # حمل المزروع (kN)
+    'CONC_DEN': 25.0,    # كثافة الخرسانة
 }
 
-class StructuralFixFinalV2:
+class AnalyticalDesigner:
     def __init__(self, filepath):
         self.filepath = filepath
         try:
             self.doc = ezdxf.readfile(filepath)
             self.msp = self.doc.modelspace()
-            print("✅ تم التحميل. جاري التحليل...")
-        except Exception as e:
-            print(f"❌ خطأ: {e}")
-            self.doc = None
-            return
+            print("✅ جاري التحليل الإنشائي (عزوم، قص، انحناء)...")
+        except: return
 
-        # ---------------------------------------------------------
-        # 1. كشف الوحدات الذكي (Smart Unit Detection v2)
-        # ---------------------------------------------------------
-        # بدلاً من الإحداثيات، سنقيس "أبعاد" العناصر نفسها
-        widths = []
-        for e in self.msp.query('LWPOLYLINE'):
-            if len(widths) > 20: break
-            # حساب أصغر بعد (العرض)
-            pts = e.get_points('xy')
-            if not pts: continue
-            xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
-            w, h = max(xs)-min(xs), max(ys)-min(ys)
-            if w > 0 and h > 0:
-                widths.append(min(w, h))
-
-        avg_w = sum(widths)/len(widths) if widths else 0.0
-
-        # الحكم المنطقي
-        if avg_w > 10.0:
-            # مستحيل أن يكون عرض عمود 200 متر! إذن هو مليمتر
-            self.IS_MM = True
-            self.SCALE = 1000.0
-            self.LIMIT_TRANS = 390.0 # حد التحويلية (ملم)
-            print(f"   - الوحدات المكتشفة: مليمتر (متوسط العرض {int(avg_w)})")
-        else:
-            # عرض 0.20 أو 0.40 منطقي للمتر
-            self.IS_MM = False
-            self.SCALE = 1.0
-            self.LIMIT_TRANS = 0.39  # حد التحويلية (متر)
-            print(f"   - الوحدات المكتشفة: متر (متوسط العرض {avg_w:.2f})")
-
-        # الطبقات
+        # تجهيز الطبقات
         self.LAYERS = {
-            'COL': 'S-COL-CONC', 'BEAM': 'S-BEAM-MAIN',
-            'OUT_COL': 'S-DESIGN-COL', 'OUT_FND': 'S-DESIGN-FND',
-            'OUT_BEAM': 'S-DESIGN-BEAM', 'OUT_TXT': 'S-DESIGN-TXT'
+            'IN_COL': 'S-COL-CONC', 'IN_BEAM': 'S-BEAM-MAIN',
+            'OUT_COL': 'S-RES-COL', 'OUT_FND': 'S-RES-FND',
+            'OUT_BEAM': 'S-RES-BEAM', 'OUT_TXT': 'S-RES-TXT'
         }
-        for k, name in self.LAYERS.items():
-            if name not in self.doc.layers: self.doc.layers.new(name)
+        for k, v in self.LAYERS.items():
+            if v not in self.doc.layers: self.doc.layers.new(v)
 
-        self.beams_db = []
-        self.report_beams = []
-        self.report_cols = []
+        self.beams_data = []
+        self.excel_beams = []
+        self.excel_cols = []
 
     def get_geo(self, e):
         pts = e.get_points('xy')
@@ -75,75 +48,147 @@ class StructuralFixFinalV2:
         cx, cy = sum(xs)/len(xs), sum(ys)/len(ys)
         return cx, cy, w, h, min(xs), max(xs), min(ys), max(ys)
 
-    # --- معالجة الميدات ---
+    # ========================================================
+    # 🧠 المحرك الإنشائي (The Structural Engine)
+    # ========================================================
+    def design_section(self, span, width, is_trans):
+        """
+        تقوم هذه الدالة بحساب العمق المطلوب بناءً على العزم والقص
+        """
+        # 1. الافتراض الأولي (Start Assumption)
+        depth = 0.40 # نبدأ بـ 40 سم
+        min_depth_code = span / 14 # ACI min for deflection (simple)
+        depth = max(depth, min_depth_code)
+
+        # حلقة التصميم (تستمر حتى يصبح القطاع آمن)
+        while True:
+            # أ) تحليل الأحمال (Loads Analysis)
+            # الوزن الذاتي يتغير مع تغير العمق
+            self_wt = width * depth * CONST['CONC_DEN'] * 1.2 # Ultimate
+            w_u = self_wt + (CONST['WALL_LOAD'] * 1.6) # Ultimate Distributed
+
+            # ب) حساب العزم وقوى القص (Structural Analysis)
+            if is_trans:
+                # ميدة تحويلية (حمل موزع + حمل مركز)
+                # Mu = wL^2/8 + PL/4
+                Mu = (w_u * span**2 / 8) + (CONST['PLANTED_P'] * 1.4 * span / 4)
+                # Vu = wL/2 + P/2
+                Vu = (w_u * span / 2) + (CONST['PLANTED_P'] * 1.4 / 2)
+            else:
+                # ميدة عادية
+                Mu = (w_u * span**2 / 8)
+                Vu = (w_u * span / 2)
+
+            # ج) التحقق من الانحناء (Flexure Check)
+            # Mu <= Phi * Mn
+            # نحسب أقصى عزم يتحمله القطاع الخرساني (Singly Reinforced Limit)
+            # R_max تقريبي لخرسانة 30 وحديد 420 هو حوالي 5-6 MPa
+            # Mn_max = R_max * b * d^2
+            d = depth - 0.05 # Effective depth
+            Mn_capacity = 5.0 * width * (d**2) * 1000 # kNm
+            Phi_Mn = CONST['PHI_B'] * Mn_capacity
+
+            # د) التحقق من القص (Shear Check)
+            # Vc = 0.17 * sqrt(fc) * b * d
+            Vc = 0.17 * math.sqrt(CONST['FC']) * (width*1000) * (d*1000) / 1000 # kN
+            Phi_Vc = CONST['PHI_V'] * Vc
+            # الكود يسمح بأن يتحمل الحديد القص الزائد، لكن نزيد العمق لو القص عالي جداً
+            # شرط: Vu يجب ألا يتجاوز Phi*(Vc + 8*sqrt(fc)*bd) -> Limit for section size
+            max_shear_capacity = 5 * Phi_Vc # فرضية أن الكانات ستتحمل الباقي
+
+            # هـ) القرار (Decision)
+            if Phi_Mn >= Mu and max_shear_capacity >= Vu:
+                # القطاع آمن!
+                break
+            else:
+                # القطاع غير آمن، زد العمق 5 سم
+                depth += 0.05
+                if depth > 1.5: break # سقف للأمان لكي لا يعلق الكود
+
+        # تقريب العمق لأقرب 5 سم
+        depth = math.ceil(depth * 20) / 20.0
+
+        # حساب الحديد النهائي للقطاع المعتمد
+        d = depth - 0.05
+        # As = Mu / (Phi * fy * 0.9d) -- تقريب ذراع العزم j*d
+        as_req = (Mu * 10**6) / (0.9 * CONST['FY'] * 0.9 * d * 1000)
+
+        return depth, Mu, Vu, as_req
+
+    # ----------------------------------------------------
+    # معالجة الميدات (تنفيذ التصميم)
+    # ----------------------------------------------------
     def process_beams(self):
-        query = f'LWPOLYLINE[layer=="{self.LAYERS["BEAM"]}"]'
+        query = f'LWPOLYLINE[layer=="{self.LAYERS["IN_BEAM"]}"]'
         count = 1
 
         for e in self.msp.query(query):
             if not e.is_closed: continue
             cx, cy, w, h, x1, x2, y1, y2 = self.get_geo(e)
 
-            b_width = min(w, h); span = max(w, h)
+            # الأبعاد الهندسية
+            width = min(w, h); span = max(w, h)
+            # تجاهل الأخطاء الصغيرة
+            if span < 0.5: continue
 
-            # تحديد التحويلية
-            is_trans = (b_width >= self.LIMIT_TRANS)
+            # تصنيف النوع (لإضافة حمل المزروع)
+            is_trans = (width >= 0.39) # 40 سم
 
-            self.beams_db.append({'box': (x1, x2, y1, y2), 'is_trans': is_trans})
+            # ==============================
+            # 🔥 اللحظة الحاسمة: التصميم
+            # ==============================
+            calc_depth, Mu, Vu, As_req = self.design_section(span, width, is_trans)
 
-            # الحسابات (بالمتر دائماً)
-            math_w = b_width / self.SCALE
-            math_span = span / self.SCALE
+            # تحويل مساحة الحديد لعدد أسياخ
+            dia = 16 if is_trans else 14
+            bar_area = 201 if dia==16 else 154
+            num_bars = math.ceil(As_req / bar_area)
+            if num_bars < 3: num_bars = 3 # Minimum
 
-            # تجاهل العناصر الصغيرة جداً (أخطاء رسم)
-            if math_span < 0.5: continue
+            # تخزين البيانات
+            self.beams_data.append({'box': (x1, x2, y1, y2), 'is_trans': is_trans})
 
+            # التلوين والطبقات
+            e.dxf.layer = self.LAYERS['OUT_BEAM']
             if is_trans:
-                e.dxf.layer = self.LAYERS['OUT_BEAM']; e.dxf.color = 6 # Magenta
-                depth = 0.80; dia = 16; txt_type = "TR"
-                mu = (12 * math_span**2 / 8) + (CONFIG['PLANTED_COL_LOAD'] * math_span / 4)
+                e.dxf.color = 6 # Magenta
+                type_txt = "TR"
             else:
-                e.dxf.layer = self.LAYERS['OUT_BEAM']; e.dxf.color = 3 # Green
-                depth = 0.60; dia = 14; txt_type = "B"
-                mu = (12 * math_span**2 / 8)
+                e.dxf.color = 3 # Green
+                type_txt = "B"
 
-            d_eff = depth - 0.05
-            as_req = (mu * 10**6) / (0.85 * CONFIG['FY'] * d_eff * 1000)
-            bars = math.ceil(as_req / (201 if dia==16 else 154))
-            if bars < 3: bars = 3
-
-            # الكتابة (Dynamic Text Size)
-            # نستخدم نسبة من العرض لضمان القراءة
-            txt_h = b_width * 0.35
-
-            label = f"{txt_type}\n{int(math_w*100)}x{int(depth*100)}\n{bars}T{dia}"
+            # الكتابة على الرسم
+            label = f"{type_txt}\n{int(width*100)}x{int(calc_depth*100)}\n{num_bars}T{dia}"
+            txt_h = width * 0.30
             self.add_text(cx, cy, label, txt_h, 7)
 
-            # التقرير
-            self.report_beams.append({
-                'ID': f"{txt_type}-{count}",
-                'Type': "Transfer" if is_trans else "Tie",
-                'W(m)': round(math_w, 2),
-                'D(m)': depth,
-                'Span(m)': round(math_span, 2),
-                'Mu(kN.m)': int(mu),
-                'Rebar': f"{bars}T{dia}"
+            # إضافة للإكسل (مع القوى المحسوبة)
+            self.excel_beams.append({
+                'ID': f"{type_txt}-{count}",
+                'Span (m)': round(span, 2),
+                'Width (m)': round(width, 2),
+                'Calc Depth (m)': calc_depth, # العمق المحسوب وليس المفروض!
+                'Moment (kN.m)': int(Mu),
+                'Shear (kN)': int(Vu),
+                'Rebar': f"{num_bars} T{dia}"
             })
             count += 1
 
-    # --- معالجة الأعمدة ---
+    # ----------------------------------------------------
+    # معالجة الأعمدة والقواعد
+    # ----------------------------------------------------
     def process_columns(self):
-        query = f'LWPOLYLINE[layer=="{self.LAYERS["COL"]}"]'
+        query = f'LWPOLYLINE[layer=="{self.LAYERS["IN_COL"]}"]'
         count = 1
 
         for e in self.msp.query(query):
             if not e.is_closed: continue
             cx, cy, w, h, x1, x2, y1, y2 = self.get_geo(e)
 
-            # كشف المزروع (هامش تلامس)
+            # كشف المزروع
             is_planted = False
-            tol = min(w, h) * 0.5
-            for b in self.beams_db:
+            tol = 0.1
+            for b in self.beams_data:
                 if b['is_trans']:
                     bx1, bx2, by1, by2 = b['box']
                     if (bx1-tol < cx < bx2+tol) and (by1-tol < cy < by2+tol):
@@ -151,41 +196,46 @@ class StructuralFixFinalV2:
 
             e.dxf.layer = self.LAYERS['OUT_COL']; e.dxf.color = 4
 
-            math_w = w / self.SCALE; math_h = h / self.SCALE
+            # حساب الحمل (تراكمي للطوابق)
+            # Area * Load * Floors
+            pu = (w * h * 130) * CONFIG['LOAD_m2'] * CONFIG['FLOORS'] * 9.81 * 1.4
 
-            # تجاهل الصغير جدا
-            if math_w < 0.1: continue
+            # تسليح العمود (1% Min)
+            ag = w * h * 1e6
+            bars = math.ceil((0.01 * ag) / 201)
+            bars = max(bars, 6)
 
-            pu = (math_w * math_h * 130) * CONFIG['LOAD_m2'] * CONFIG['FLOORS'] * 9.81 * 1.4
+            tag = "P" if is_planted else f"C{count}"
+            self.add_text(cx, cy, f"{tag}\n{int(pu)}kN", min(w,h)*0.35, 1)
 
-            txt_h = min(w, h) * 0.35
-            col_tag = "Planted" if is_planted else f"C{count}"
-            self.add_text(cx, cy, f"{col_tag}\n{int(pu)}kN", txt_h, 1)
-
-            footing_txt = "Planted"
-            # رسم القاعدة (لغير المزروع)
+            ft_txt = "---"
             if not is_planted:
-                p_srv = pu / 1.4; area = p_srv / CONFIG['SBC']
-                side = math.sqrt(area); side = max(side, 1.2)
-                side = math.ceil(side * 10) / 10.0
+                # تصميم القاعدة (Area = P / Capacity)
+                req_area = (pu/1.4) / CONFIG['SBC']
+                side = math.ceil(math.sqrt(req_area)*10)/10.0
+                side = max(side, 1.2)
 
-                draw_side = side * self.SCALE
-                depth = 0.60
+                # سماكة القاعدة (للثقب Punching)
+                # تقريب: السماكة تزيد مع الحمل
+                ft_depth = 0.50 if side < 1.8 else 0.60
+                if side > 2.5: ft_depth = 0.70
 
-                hw = draw_side / 2
+                # رسم القاعدة
+                hw = side * 1.0 / 2 # Scale 1.0 (Meter)
                 pts = [(cx-hw, cy-hw), (cx+hw, cy-hw), (cx+hw, cy+hw), (cx-hw, cy+hw)]
                 self.msp.add_lwpolyline(pts, dxfattribs={'layer': self.LAYERS['OUT_FND'], 'closed':True, 'color': 2})
 
-                self.add_text(cx, cy - draw_side/2 - txt_h, f"F:{side}x{side}", txt_h, 7)
-                footing_txt = f"{side}x{side}x{depth}"
+                self.add_text(cx, cy - side/2 - 0.2, f"F:{side}x{side}", 0.15, 7)
+                ft_txt = f"{side}x{side}x{ft_depth}"
 
-            self.report_cols.append({
-                'ID': col_tag,
-                'Dim(m)': f"{round(math_w,2)}x{round(math_h,2)}",
-                'Load(kN)': int(pu),
-                'Footing': footing_txt
+            self.excel_cols.append({
+                'ID': tag,
+                'Dims': f"{w:.2f}x{h:.2f}",
+                'Load (kN)': int(pu),
+                'Col Rebar': f"{bars} T16",
+                'Footing': ft_txt
             })
-            count += 1
+            if not is_planted: count += 1
 
     def add_text(self, x, y, text, h, color):
         self.msp.add_mtext(text, dxfattribs={
@@ -198,20 +248,28 @@ class StructuralFixFinalV2:
         self.process_beams()
         self.process_columns()
 
-        dxf_out = self.filepath.replace(".dxf", "_FINAL_V2.dxf")
-        xls_out = self.filepath.replace(".dxf", "_DATA_V2.xlsx")
+        dxf_out = self.filepath.replace(".dxf", "_ANALYTICAL.dxf")
+        xls_out = self.filepath.replace(".dxf", "_CALCS.xlsx")
 
         self.doc.saveas(dxf_out)
         with pd.ExcelWriter(xls_out) as writer:
-            pd.DataFrame(self.report_beams).to_excel(writer, sheet_name='Beams', index=False)
-            pd.DataFrame(self.report_cols).to_excel(writer, sheet_name='Columns', index=False)
+            pd.DataFrame(self.excel_beams).to_excel(writer, sheet_name='Beams Analysis', index=False)
+            pd.DataFrame(self.excel_cols).to_excel(writer, sheet_name='Cols & Footings', index=False)
 
-        print(f"🎉 تم الإصلاح! \n- DXF: {dxf_out} \n- Excel: {xls_out}")
+        print(f"🎉 تم التصميم التحليلي! \n- المخطط: {dxf_out} \n- الحسابات: {xls_out}")
+
+# إعدادات المستخدم (يمكنك تعديلها هنا)
+CONFIG = {
+    'FC': 30.0, 'FY': 420.0, 'SBC': 200.0,
+    'FLOORS': 5, 'LOAD_m2': 1.6,
+    'PLANTED_P': 450.0, 'WALL_LOAD': 12.0,
+    'PHI_B': 0.9, 'PHI_V': 0.75, 'CONC_DEN': 25.0
+}
 
 if __name__ == "__main__":
     if os.path.exists("MyDrawing.dxf"):
-        StructuralFixFinalV2("MyDrawing.dxf").run()
+        AnalyticalDesigner("MyDrawing.dxf").run()
     elif os.path.exists("My Drawing.dxf"):
-        StructuralFixFinalV2("My Drawing.dxf").run()
+        AnalyticalDesigner("My Drawing.dxf").run()
     else:
-        print("⚠️ يرجى رفع الملف باسم MyDrawing.dxf")
+        print("⚠️ الملف غير موجود: MyDrawing.dxf أو My Drawing.dxf")
