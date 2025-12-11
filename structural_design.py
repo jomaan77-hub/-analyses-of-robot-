@@ -1,163 +1,196 @@
 import ezdxf
+import math
+import pandas as pd
 import os
 
-class SmartStructuralFix:
+# ==========================================
+# ⚙️ إعدادات التصميم
+# ==========================================
+CONFIG = {
+    'FC': 30.0, 'FY': 420.0, 'SBC': 200.0,
+    'FLOORS': 5, 'LOAD_m2': 1.6,
+    'WALL_LOAD_M': 12.0, 'PLANTED_COL_LOAD': 450.0,
+}
+
+class StructuralFixFinalWithExcel:
     def __init__(self, filepath):
-        self.filepath = filepath  # ✅ تم إصلاح الخطأ: حفظ مسار الملف
+        self.filepath = filepath
         try:
             self.doc = ezdxf.readfile(filepath)
             self.msp = self.doc.modelspace()
-            print("✅ تم تحميل الملف. جاري المعالجة الذكية...")
+            print("✅ تم التحميل. جاري التحليل والرسم وحساب الكميات...")
         except Exception as e:
-            print(f"❌ خطأ في قراءة الملف: {e}")
+            print(f"❌ خطأ: {e}")
             self.doc = None
             return
 
-        # 1. كشف الوحدات تلقائياً (Auto-Detect Units)
+        # كشف الوحدات
         sample_pts = []
         for e in self.msp.query('LWPOLYLINE'):
-             if len(sample_pts) > 10: break
+             if len(sample_pts) > 5: break
              sample_pts.extend(e.get_points('xy'))
+        avg = sum([p[0] for p in sample_pts])/len(sample_pts) if sample_pts else 0
 
-        avg_coord = sum([p[0] for p in sample_pts])/len(sample_pts) if sample_pts else 0
+        if avg > 500: # مليمتر
+            self.IS_MM = True; self.SCALE = 1000.0; self.LIMIT_TRANS = 390.0
+        else: # متر
+            self.IS_MM = False; self.SCALE = 1.0; self.LIMIT_TRANS = 0.39
 
-        if avg_coord > 500:
-            self.UNIT_SCALE = "MM"
-            self.LIMIT_40CM = 400.0  # حد الميدة التحويلية
-            self.TXT_RATIO = 250.0   # معامل (غير مستخدم حالياً لكن موجود)
-            print("   - الوحدات المكتشفة: مليمتر (MM)")
-        else:
-            self.UNIT_SCALE = "M"
-            self.LIMIT_40CM = 0.40   # حد الميدة التحويلية
-            self.TXT_RATIO = 0.25
-            print("   - الوحدات المكتشفة: متر (M)")
-
-        # إعداد الطبقات
+        # الطبقات
         self.LAYERS = {
-            'COL_IN': 'S-COL-CONC', 'BEAM_IN': 'S-BEAM-MAIN',
-            'COL_OUT': 'S-DESIGN-COL', 'FND_OUT': 'S-DESIGN-FND',
-            'BEAM_OUT': 'S-DESIGN-BEAM', 'TXT': 'S-DESIGN-TXT'
+            'COL': 'S-COL-CONC', 'BEAM': 'S-BEAM-MAIN',
+            'OUT_COL': 'S-DESIGN-COL', 'OUT_FND': 'S-DESIGN-FND',
+            'OUT_BEAM': 'S-DESIGN-BEAM', 'OUT_TXT': 'S-DESIGN-TXT'
         }
         for k, name in self.LAYERS.items():
             if name not in self.doc.layers: self.doc.layers.new(name)
 
         self.beams_db = []
 
-    def get_geometry(self, entity):
-        pts = entity.get_points('xy')
+        # قوائم لتخزين بيانات التقرير (Excel Data)
+        self.report_beams = []
+        self.report_cols = []
+
+    def get_geo(self, e):
+        pts = e.get_points('xy')
         xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
-        minx, maxx, miny, maxy = min(xs), max(xs), min(ys), max(ys)
-        w, h = maxx-minx, maxy-miny
+        w, h = max(xs)-min(xs), max(ys)-min(ys)
         cx, cy = sum(xs)/len(xs), sum(ys)/len(ys)
-        return cx, cy, w, h, minx, maxx, miny, maxy
+        return cx, cy, w, h, min(xs), max(xs), min(ys), max(ys)
 
-    # --- 1. تحليل الميدات (بدقة الوحدات) ---
-    def analyze_beams(self):
-        query = f'LWPOLYLINE[layer=="{self.LAYERS["BEAM_IN"]}"]'
+    # --- 1. معالجة الميدات + تسجيل بيانات الإكسل ---
+    def process_beams(self):
+        query = f'LWPOLYLINE[layer=="{self.LAYERS["BEAM"]}"]'
+        count = 1
+
         for e in self.msp.query(query):
             if not e.is_closed: continue
-            cx, cy, w, h, x1, x2, y1, y2 = self.get_geometry(e)
+            cx, cy, w, h, x1, x2, y1, y2 = self.get_geo(e)
 
-            # العرض هو الضلع الأصغر
-            beam_width = min(w, h)
+            b_width = min(w, h); span = max(w, h)
+            is_trans = (b_width >= self.LIMIT_TRANS)
 
-            # الشرط الفاصل (حسب الوحدة المكتشفة)
-            # نطرح هامش بسيط (0.01) لتفادي مشاكل التقريب
-            is_transfer = (beam_width >= (self.LIMIT_40CM - 0.01))
+            self.beams_db.append({'box': (x1, x2, y1, y2), 'is_trans': is_trans})
 
-            self.beams_db.append({
-                'rect': (x1, x2, y1, y2), # حدود الميدة
-                'is_transfer': is_transfer,
-                'width': beam_width,
-                'entity': e
-            })
+            # الحسابات
+            math_w = b_width / self.SCALE
+            math_span = span / self.SCALE
 
-    # --- 2. معالجة الأعمدة والقواعد ---
-    def process_columns(self):
-        query = f'LWPOLYLINE[layer=="{self.LAYERS["COL_IN"]}"]'
-        for e in self.msp.query(query):
-            if not e.is_closed: continue
-            cx, cy, w, h, _, _, _, _ = self.get_geometry(e)
-
-            # فحص: هل العمود مزروع؟
-            is_planted = False
-            for b in self.beams_db:
-                if b['is_transfer']:
-                    bx1, bx2, by1, by2 = b['rect']
-                    # هل مركز العمود داخل الميدة؟
-                    if (bx1 < cx < bx2) and (by1 < cy < by2):
-                        is_planted = True
-                        break
-
-            # نقل العمود للطبقة الجديدة وتلوينه
-            e.dxf.layer = self.LAYERS['COL_OUT']
-            e.dxf.color = 4 # Cyan
-
-            # حجم النص الذكي: 40% من عرض العمود
-            # هذا يضمن أن النص لن يكون عملاقاً أبداً
-            txt_h = min(w, h) * 0.40
-
-            # كتابة النص
-            lbl = "Planted" if is_planted else "C1"
-            self.add_text(cx, cy, lbl, txt_h, 1) # Yellow text
-
-            # رسم القاعدة (فقط إذا لم يكن مزروعاً)
-            if not is_planted:
-                self.draw_footing(cx, cy, w, h)
-
-    # --- 3. رسم القاعدة ---
-    def draw_footing(self, cx, cy, col_w, col_h):
-        # القاعدة تكون 3 أضعاف العمود تقريباً
-        f_side = max(col_w, col_h) * 3.0
-
-        hw = f_side / 2
-        pts = [(cx-hw, cy-hw), (cx+hw, cy-hw), (cx+hw, cy+hw), (cx-hw, cy+hw)]
-        self.msp.add_lwpolyline(pts, dxfattribs={'layer': self.LAYERS['FND_OUT'], 'closed':True, 'color': 2})
-
-        # نص القاعدة (أصغر قليلاً من نص العمود)
-        txt_h = min(col_w, col_h) * 0.30
-        self.add_text(cx, cy - f_side/2 - txt_h, f"F", txt_h, 7)
-
-    # --- 4. تلوين الميدات ---
-    def draw_beams(self):
-        for b in self.beams_db:
-            e = b['entity']
-            e.dxf.layer = self.LAYERS['BEAM_OUT']
-
-            if b['is_transfer']:
-                e.dxf.color = 6 # Magenta
-                txt = "TR"
+            if is_trans:
+                e.dxf.layer = self.LAYERS['OUT_BEAM']; e.dxf.color = 6
+                depth = 0.80; dia = 16; txt_type = "TR"
+                mu = (12 * math_span**2 / 8) + (CONFIG['PLANTED_COL_LOAD'] * math_span / 4)
             else:
-                e.dxf.color = 3 # Green
-                txt = "B"
+                e.dxf.layer = self.LAYERS['OUT_BEAM']; e.dxf.color = 3
+                depth = 0.60; dia = 14; txt_type = "B"
+                mu = (12 * math_span**2 / 8)
 
-            # كتابة نص الميدة
-            cx, cy, w, h, _, _, _, _ = self.get_geometry(e)
-            txt_h = min(w, h) * 0.30
-            self.add_text(cx, cy, txt, txt_h, 7)
+            d_eff = depth - 0.05
+            as_req = (mu * 10**6) / (0.85 * CONFIG['FY'] * d_eff * 1000)
+            bars = math.ceil(as_req / (201 if dia==16 else 154))
+            if bars < 3: bars = 3
+
+            # الكتابة في الرسم
+            txt_h = b_width * 0.35
+            label = f"{txt_type}\n{int(math_w*100)}x{int(depth*100)}\n{bars}T{dia}"
+            self.add_text(cx, cy, label, txt_h, 7)
+
+            # === إضافة لتقرير الإكسل ===
+            self.report_beams.append({
+                'Beam ID': f"{txt_type}-{count}",
+                'Type': "Transfer" if is_trans else "Tie-Beam",
+                'Width (m)': round(math_w, 2),
+                'Depth (m)': depth,
+                'Span (m)': round(math_span, 2),
+                'Moment (kN.m)': round(mu, 1),
+                'Rebar': f"{bars} T{dia}"
+            })
+            count += 1
+
+    # --- 2. معالجة الأعمدة والقواعد + تسجيل بيانات الإكسل ---
+    def process_columns(self):
+        query = f'LWPOLYLINE[layer=="{self.LAYERS["COL"]}"]'
+        count = 1
+
+        for e in self.msp.query(query):
+            if not e.is_closed: continue
+            cx, cy, w, h, x1, x2, y1, y2 = self.get_geo(e)
+
+            # كشف المزروع
+            is_planted = False
+            tol = min(w, h) * 0.5
+            for b in self.beams_db:
+                if b['is_trans']:
+                    bx1, bx2, by1, by2 = b['box']
+                    if (bx1-tol < cx < bx2+tol) and (by1-tol < cy < by2+tol):
+                        is_planted = True; break
+
+            e.dxf.layer = self.LAYERS['OUT_COL']; e.dxf.color = 4
+
+            math_w = w / self.SCALE; math_h = h / self.SCALE
+            pu = (math_w * math_h * 130) * CONFIG['LOAD_m2'] * CONFIG['FLOORS'] * 9.81 * 1.4
+
+            txt_h = min(w, h) * 0.35
+            col_tag = "Planted" if is_planted else f"C{count}"
+            self.add_text(cx, cy, f"{col_tag}\n{int(pu)}kN", txt_h, 1)
+
+            # القواعد والتقرير
+            footing_info = "None (Planted)"
+            if not is_planted:
+                p_srv = pu / 1.4; area = p_srv / CONFIG['SBC']
+                side = math.sqrt(area); side = max(side, 1.2)
+                side = math.ceil(side * 10) / 10.0
+
+                draw_side = side * self.SCALE
+                depth = 0.60
+
+                hw = draw_side / 2
+                pts = [(cx-hw, cy-hw), (cx+hw, cy-hw), (cx+hw, cy+hw), (cx-hw, cy+hw)]
+                self.msp.add_lwpolyline(pts, dxfattribs={'layer': self.LAYERS['OUT_FND'], 'closed':True, 'color': 2})
+
+                lbl_f = f"F: {side}x{side}x{depth}"
+                self.add_text(cx, cy - draw_side/2 - txt_h, lbl_f, txt_h, 7)
+                footing_info = f"{side}x{side}x{depth}"
+
+            # === إضافة لتقرير الإكسل ===
+            self.report_cols.append({
+                'Col ID': col_tag if is_planted else f"C{count}",
+                'Status': "Planted on Beam" if is_planted else "On Foundation",
+                'Dims (m)': f"{round(math_w,2)}x{round(math_h,2)}",
+                'Load (kN)': int(pu),
+                'Footing Dims': footing_info
+            })
+            count += 1
 
     def add_text(self, x, y, text, h, color):
         self.msp.add_mtext(text, dxfattribs={
             'insert': (x, y), 'char_height': h,
-            'layer': self.LAYERS['TXT'], 'color': color, 'attachment_point': 5
+            'layer': self.LAYERS['OUT_TXT'], 'color': color, 'attachment_point': 5
         })
 
     def run(self):
         if not self.doc: return
-        self.analyze_beams()
+        self.process_beams()
         self.process_columns()
-        self.draw_beams()
 
-        # حفظ الملف باسم جديد
-        out = self.filepath.replace(".dxf", "_CLEAN.dxf")
-        self.doc.saveas(out)
-        print(f"🎉 تم التنظيف! الملف الجاهز: {out}")
+        # 1. حفظ ملف DXF
+        dxf_out = self.filepath.replace(".dxf", "_FINAL.dxf")
+        self.doc.saveas(dxf_out)
+
+        # 2. حفظ ملف Excel
+        xls_out = self.filepath.replace(".dxf", "_REPORT.xlsx")
+
+        # نستخدم Pandas لكتابة شيتين (Sheets) داخل ملف إكسل واحد
+        with pd.ExcelWriter(xls_out) as writer:
+            pd.DataFrame(self.report_beams).to_excel(writer, sheet_name='Beams & Rebar', index=False)
+            pd.DataFrame(self.report_cols).to_excel(writer, sheet_name='Columns & Footings', index=False)
+
+        print(f"🎉 تم! \n- المخطط: {dxf_out} \n- التقرير: {xls_out}")
 
 if __name__ == "__main__":
-    # تأكد أن اسم الملف مطابق لما رفعته
     if os.path.exists("MyDrawing.dxf"):
-        SmartStructuralFix("MyDrawing.dxf").run()
+        StructuralFixFinalWithExcel("MyDrawing.dxf").run()
     elif os.path.exists("My Drawing.dxf"):
-        SmartStructuralFix("My Drawing.dxf").run()
+        StructuralFixFinalWithExcel("My Drawing.dxf").run()
     else:
-        print("⚠️ يرجى رفع ملف DXF وتسميته MyDrawing.dxf")
+        print("⚠️ ملف MyDrawing.dxf غير موجود")
